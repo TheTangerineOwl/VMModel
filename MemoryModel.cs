@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System;
+using System.Text;
 
 namespace VirtualMemory
 {
@@ -9,9 +10,17 @@ namespace VirtualMemory
     {
         int _bufferSize;
         int _arraySize;
+        // Файловый указатель виртуального массива.
         Stream array;
+        // Буфер страниц.
         MemoryPage[] pages;
 
+        /// <summary>
+        /// Страничная модель виртуальной памяти, в которой хранится массив указанной длины, хранящаяся в файле дампа.
+        /// </summary>
+        /// <param name="bufferSize">Количество страниц в буфере.</param>
+        /// <param name="arraySize">Размер виртуального массива.</param>
+        /// <param name="filename">Имя файла дампа.</param>
         public MemoryModel(int bufferSize = 3, int arraySize = 10000, string filename = "vm.bin")
         {
             _bufferSize = bufferSize;
@@ -22,12 +31,11 @@ namespace VirtualMemory
                 array = new FileStream(filename, FileMode.Create, FileAccess.ReadWrite);
                 byte[] buffer = Encoding.Default.GetBytes("VM");
                 array.Write(buffer, 0, buffer.Length);
-                int bytesCount = (arraySize / MemoryPage.byteNum + 1) * MemoryPage.pageSize;
+                int bytesCount = (int)Math.Ceiling((double)(arraySize / (MemoryPage.byteNum * 8))) * MemoryPage.pageSize;
                 for (int i = 0; i < bytesCount; i++)
                     array.WriteByte(0);
             }
             else
-                // В случае, если файл дампа уже существует, открывает его для работы.
                 array = new FileStream(filename, FileMode.Open, FileAccess.ReadWrite);
             // Пропускает сигнатуру в начале файла.
             array.Seek(2, SeekOrigin.Begin);
@@ -38,95 +46,155 @@ namespace VirtualMemory
             for (int i = 0; i < bufferSize; i++)
             {
                 MemoryPage newPage = new MemoryPage(i);
-                // Копирование битовой карты из памяти для выбранной страницы в буфере.
+                // Копирование битовой карты из памяти.
                 Buffer.BlockCopy(data, i * MemoryPage.pageSize, newPage.Bitmap, 0, MemoryPage.byteNum);
-                // Копирование данных из памяти для выбранной страницы в буфере.
-                Buffer.BlockCopy(data, i * MemoryPage.pageSize + MemoryPage.byteNum, newPage.Data, 0, MemoryPage.byteNum * sizeof(int));
+                Buffer.BlockCopy(data, i * MemoryPage.pageSize + MemoryPage.byteNum, newPage.Data, 0, MemoryPage.byteNum * sizeof(int) * 8);
                 pages[i] = newPage;
             }
 
         }
 
-        public int? FindPage(int index)     // определить и вернуть номер страницы в буфере по индексу данных в массиве
+        /// <summary>
+        /// Получение информации о бите с заданным индексом в битовой карте.
+        /// </summary>
+        /// <param name="_bitmap">Битовая карта страницы.</param>
+        /// <param name="index">Индекс бита в битовой карте.</param>
+        /// <returns>true, если бит равен 1; false, если бит равен 0.</returns>
+        public static bool GetBit(byte[] _bitmap, int index)
         {
-            int pageIndex = index / MemoryPage.byteNum;     // определить абсолютный номер страницы
-            if (pageIndex > _arraySize / MemoryPage.byteNum)
-                return null;   // проверка наличия страницы в памяти
+            byte areaByte = _bitmap[index / 8];
+            if (areaByte == 0) return false;
+            int mask = 0b1 << (index % 8);
+            return (areaByte & mask) != 0;
+        }
 
-            MemoryPage? page = pages.FirstOrDefault(page => page.Index == pageIndex); // поиск страницы в буфере
+        /// <summary>
+        /// Установка бита с заданным индексом в битовой карте в указанное значение.
+        /// </summary>
+        /// <param name="_bitmap">Битовая карта страницы.</param>
+        /// <param name="index">Индекс бита в битовой карте.</param>
+        /// <param name="value">Значение для установки: true, чтобы установить бит 1; false, чтобы установить бит 0.</param>
+        public static void SetBit(ref byte[] _bitmap, int index, bool value)
+        {
+            byte mask;
+            if (value)
+            {
+                mask = (byte)(0b1 << (index % 8));
+                _bitmap[index / 8] = (byte)(_bitmap[index / 8] | mask);
+            }
+            else
+            {
+                mask = (byte)(~(0b1 << (index % 8)));
+                _bitmap[index / 8] = (byte)(_bitmap[index / 8] & mask);
+            }
+        }
 
+        /// <summary>
+        /// Определение и возврат номера страницы в буфере по индексу значения в массиве.
+        /// </summary>
+        /// <param name="index">Индекс значения в массиве.</param>
+        /// <returns>Номер страницы в буфере; null, если такой страницы не существует.</returns>
+        public int? FindPage(int index)
+        {
+            // Определение абсолютного номера страницы.
+            int pageIndex = index / (MemoryPage.byteNum * 8);
+            if (pageIndex > _arraySize / (MemoryPage.byteNum * 8))
+                return null;
+
+            // Поиск страницы с указанным номером в буфере.
+            MemoryPage? page = pages.FirstOrDefault(page => page.Index == pageIndex);
+
+            // Если отсутствует в буфере, то самая старая страница заменяется нужной.
             if (page == null)
             {
-                MemoryPage toRemove = pages.Aggregate((x, y) => x.ModTime < y.ModTime ? x : y); // поиск самой старой страницы в буфере
-
-                int toRemoveIndex = Array.IndexOf(pages, toRemove); // индекс страницы для замены
-
+                // Поиск самой старой страницы в буфере.
+                MemoryPage toRemove = pages.Aggregate((x, y) => x.ModTime < y.ModTime ? x : y);
+                int toRemoveIndex = Array.IndexOf(pages, toRemove);
 
                 if (toRemove.IsModified == true)
-                    SavePage(toRemoveIndex);   // если старая страницы была изменена, сохранить ее в памяти
+                    SavePage(toRemoveIndex);
 
-                MemoryPage newPage = new MemoryPage(pageIndex); // сброс статуса и установка нового времени изменения происходят по умолчанию
+                MemoryPage newPage = new MemoryPage(pageIndex);
 
-                array.Seek(2 + MemoryPage.pageSize * pageIndex, SeekOrigin.Begin);  // чтение страницы с нужным абсолютным индексом из памяти
-                array.Read(pages[toRemoveIndex].Bitmap, 0, MemoryPage.byteNum);
-                array.Read(pages[toRemoveIndex].Data, 0, MemoryPage.byteNum * sizeof(int));
-
-                pages[toRemoveIndex] = newPage; // замена страницы в буфере
-
-                return toRemoveIndex;   // возврат индекса страницы в буфере
+                // Чтение страницы для замены старой из памяти.
+                array.Seek(2 + MemoryPage.pageSize * pageIndex, SeekOrigin.Begin);
+                array.Read(newPage.Bitmap, 0, newPage.Bitmap.Length);
+                array.Read(newPage.Data, 0, newPage.Data.Length);
+                pages[toRemoveIndex] = newPage;
+                return toRemoveIndex;
             }
 
             return Array.IndexOf(pages, page);
         }
 
-        public bool ReadValue(out int value, int elementIndex)  // чтение значения из буфера
+        /// <summary>
+        /// Чтение значения из буфера страниц.
+        /// </summary>
+        /// <param name="value">Переменная, куда будет записано значение.</param>
+        /// <param name="elementIndex">Индекс значения в массиве.</param>
+        /// <returns>true, если операция была завершена успешно.</returns>
+        public bool ReadValue(out int value, int elementIndex)
         {
-            int pageIndex = FindPage(elementIndex) ?? -1;   // если не удалось найти страницу, то -1
+            int pageIndex = FindPage(elementIndex) ?? -1;
             value = 0;
 
             if (pageIndex == -1)
                 return false;
 
-            int onPageIndex = elementIndex % MemoryPage.byteNum;    // страничный адрес элемента массива с заданным элементом
-            if (pages[pageIndex].Bitmap[onPageIndex] == 0)
-                return false;    // если значение не было задано
+            int onPageIndex = elementIndex % (MemoryPage.byteNum * 8);
+            // Если значение не было задано.
+            if (!GetBit(pages[pageIndex].Bitmap, onPageIndex))
+                return false;
 
             byte[] bytes = new byte[sizeof(int)];
-
-            Buffer.BlockCopy(pages[pageIndex].Data, onPageIndex * sizeof(int), bytes, 0, sizeof(int));  // считывание значения
+            Buffer.BlockCopy(pages[pageIndex].Data, onPageIndex * sizeof(int), bytes, 0, sizeof(int));
             value = BitConverter.ToInt32(bytes, 0);
-            return true;    // результат завершения операции
+            return true;
         }
 
-        public bool WriteValue(int value, int elementIndex)         // запись значения (по аналогии c ReadValue)
+        /// <summary>
+        /// Запись значения в буфер страниц.
+        /// </summary>
+        /// <param name="value">Значение для записи.</param>
+        /// <param name="elementIndex">Индекс для записи значения в массив.</param>
+        /// <returns></returns>
+        public bool WriteValue(int value, int elementIndex)
         {
             int pageIndex = FindPage(elementIndex) ?? -1;
             if (pageIndex == -1)
                 return false;
 
-            int onPageIndex = elementIndex % MemoryPage.byteNum;
+            int onPageIndex = elementIndex % (MemoryPage.byteNum * 8);
             byte[] bytes = BitConverter.GetBytes(value);
-
             Buffer.BlockCopy(bytes, 0, pages[pageIndex].Data, onPageIndex * sizeof(int), sizeof(int));
-            pages[pageIndex].Bitmap[onPageIndex] = 1;
+            SetBit(ref pages[pageIndex].Bitmap, onPageIndex, true);
             pages[pageIndex].IsModified = true;
-
             return true;
         }
 
-        public void SavePage(int index)     // сохранение страницы в памяти
+        /// <summary>
+        /// Сохранение страницы из буфера в память.
+        /// </summary>
+        /// <param name="index">Индекс страницы в буфере.</param>
+        public void SavePage(int index)
         {
             array.Seek(2 + MemoryPage.pageSize * pages[index].Index, SeekOrigin.Begin);
             array.Write(pages[index].Bitmap, 0, pages[index].Bitmap.Length);
             array.Write(pages[index].Data, 0, pages[index].Data.Length);
         }
 
-        public int? this[int index] // перегрузка индексатора
+        /// <summary>
+        /// Перегрузка индексатора.
+        /// </summary>
+        /// <param name="index">Индекс значения в памяти.</param>
+        /// <returns>Значение из памяти.</returns>
+        /// <exception cref="ArgumentNullException">Исключение при попытке записать null в память.</exception>
+        public int? this[int index]
         {
             get
             {
                 if (ReadValue(out int value, index))
-                    return value;  // если находит значение, то возвращает
+                    return value;
                 else
                     return null;
             }
@@ -134,20 +202,28 @@ namespace VirtualMemory
             set
             {
                 if (value != null)
-                    WriteValue(value.Value, index);  // если значение задано, то записывает в буфер
+                    WriteValue(value.Value, index);
                 else
                     throw new ArgumentNullException("Значение не может быть null!", nameof(value));
             }
         }
 
-        public void Dispose()   // освобождение ресурсов при окончании работы
+        /// <summary>
+        /// Освобождение ресурсов при окончании работы.
+        /// </summary>
+        public void Dispose()
         {
             array.Dispose();
             GC.SuppressFinalize(this);
         }
 
+        /// <summary>
+        /// Деструктор класса при завершении работы.
+        /// </summary>
         ~MemoryModel()
         {
+            for (int i = 0; i < pages.Length; i++)
+                SavePage(i);
             array.Dispose();
         }
 
